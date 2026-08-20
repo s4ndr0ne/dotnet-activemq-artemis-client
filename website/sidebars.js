@@ -1,11 +1,13 @@
 module.exports = {
   someSidebar: {
-    Introduction: ['getting-started'],
+    Introduction: ['getting-started', 'dependency-injection'],
     Features: [
       'message-payload',
       'message-durability',
       'message-priority',
+      'message-acknowledgment',
       'consumer-credit',
+      'message-filtering',
       'connection-lifecycle',
       'auto-recovery',
       'transactions',

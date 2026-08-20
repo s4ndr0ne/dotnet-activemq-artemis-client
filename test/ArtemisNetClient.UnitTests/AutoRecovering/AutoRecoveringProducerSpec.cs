@@ -5,8 +5,10 @@ using ActiveMQ.Artemis.Client.AutoRecovering.RecoveryPolicy;
 using ActiveMQ.Artemis.Client.Exceptions;
 using ActiveMQ.Artemis.Client.InternalUtilities;
 using ActiveMQ.Artemis.Client.UnitTests.Utils;
+using Amqp;
 using Amqp.Framing;
 using Amqp.Handler;
+using Amqp.Listener;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -208,6 +210,122 @@ namespace ActiveMQ.Artemis.Client.UnitTests.AutoRecovering
             using var host2 = CreateOpenedContainerHost(endpoint, testHandler);
 
             Assert.False(producerAttached.WaitOne(ShortTimeout));
+        }
+
+        [Fact]
+        public async Task Should_not_retry_SendAsync_when_producer_link_closed_with_not_found()
+        {
+            using var host = CreateOpenedContainerHost();
+            var linkProcessor = host.CreateTestLinkProcessor();
+
+            ListenerLink producerLink = null;
+            linkProcessor.SetHandler(context =>
+            {
+                producerLink = context.Link;
+                return false;
+            });
+
+            await using var connection = await CreateConnection(host.Endpoint);
+            var producer = await connection.CreateProducerAsync("a1", RoutingType.Anycast);
+
+            try
+            {
+                await producerLink.CloseAsync(Timeout, new Error(Amqp.ErrorCode.NotFound) { Description = "AMQ119002: target address a1 does not exist" });
+            }
+            catch (Exception)
+            {
+                // ignored
+            }
+
+            var exception = await Assert.ThrowsAsync<ProducerClosedException>(() => producer.SendAsync(new Message("foo"), CancellationToken));
+            Assert.Equal(ErrorCode.NotFound, exception.ErrorCode);
+
+            // Once terminated, subsequent sends should fail immediately with ProducerClosedException.
+            await Assert.ThrowsAsync<ProducerClosedException>(() => producer.SendAsync(new Message("bar"), CancellationToken));
+        }
+
+        [Fact]
+        public async Task Should_not_retry_Send_when_producer_link_closed_with_not_found()
+        {
+            using var host = CreateOpenedContainerHost();
+            var linkProcessor = host.CreateTestLinkProcessor();
+
+            ListenerLink producerLink = null;
+            linkProcessor.SetHandler(context =>
+            {
+                producerLink = context.Link;
+                return false;
+            });
+
+            await using var connection = await CreateConnection(host.Endpoint);
+            var producer = await connection.CreateProducerAsync("a1", RoutingType.Anycast);
+
+            try
+            {
+                await producerLink.CloseAsync(Timeout, new Error(ErrorCode.NotFound) { Description = "AMQ119002: target address a1 does not exist" });
+            }
+            catch (Exception)
+            {
+                // ignored
+            }
+
+            var exception = Assert.Throws<ProducerClosedException>(() => producer.Send(new Message("foo"), CancellationToken));
+            Assert.Equal(ErrorCode.NotFound, exception.ErrorCode);
+
+            // Once terminated, subsequent sends should fail immediately with ProducerClosedException.
+            Assert.Throws<ProducerClosedException>(() => producer.Send(new Message("bar"), CancellationToken));
+        }
+
+        [Fact]
+        public async Task Should_not_recreate_producer_on_connection_recovery_after_terminal_not_found_error()
+        {
+            var endpoint = GetUniqueEndpoint();
+            var producerAttached = new ManualResetEvent(false);
+            var testHandler = new TestHandler(@event =>
+            {
+                switch (@event.Id)
+                {
+                    case EventId.LinkRemoteOpen when @event.Context is Attach attach && attach.Role:
+                        producerAttached.Set();
+                        break;
+                }
+            });
+
+            var host1 = CreateOpenedContainerHost(endpoint, testHandler);
+            var linkProcessor = host1.CreateTestLinkProcessor();
+
+            ListenerLink producerLink = null;
+            linkProcessor.SetHandler(context =>
+            {
+                producerLink = context.Link;
+                return false;
+            });
+
+            var connection = await CreateConnection(endpoint);
+            var producer = await connection.CreateProducerAsync("a1", RoutingType.Anycast);
+
+            Assert.True(producerAttached.WaitOne(Timeout));
+            producerAttached.Reset();
+
+            try
+            {
+                await producerLink.CloseAsync(Timeout, new Error(Amqp.ErrorCode.NotFound) { Description = "AMQ119002: target address a1 does not exist" });
+            }
+            catch (Exception)
+            {
+                // ignored
+            }
+
+            // SendAsync triggers TerminateAsync which should remove the producer from the recovery set.
+            await Assert.ThrowsAsync<ProducerClosedException>(() => producer.SendAsync(new Message("foo"), CancellationToken));
+
+            host1.Dispose();
+            using var host2 = CreateOpenedContainerHost(endpoint, testHandler);
+
+            // Producer should NOT be recreated after connection recovery.
+            Assert.False(producerAttached.WaitOne(ShortTimeout));
+
+            await DisposeUtil.DisposeAll(connection, host2);
         }
 
         private async Task<(IProducer producer, MessageProcessor messageProcessor, TestContainerHost host, IConnection connection)> CreateReattachedProducer()

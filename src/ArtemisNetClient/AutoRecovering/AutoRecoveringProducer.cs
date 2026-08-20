@@ -23,20 +23,27 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
             while (true)
             {
                 CheckState();
+                var producer = _producer;
 
                 try
                 {
-                    await _producer.SendAsync(message, transaction, cancellationToken).ConfigureAwait(false);
+                    await producer.SendAsync(message, transaction, cancellationToken).ConfigureAwait(false);
                     return;
                 }
-                catch (ProducerClosedException e) when (e.ErrorCode == ErrorCode.UnauthorizedAccess)
+                catch (ProducerClosedException e) when (IsTerminalProducerException(e))
                 {
                     await TerminateAsync(e).ConfigureAwait(false);
-                    
-                    // Producer does not have permissions to send on specified address 
+
+                    // Producer cannot be recovered for terminal broker-side close reasons.
                     throw;
                 }
                 catch (ProducerClosedException)
+                {
+                    HandleProducerClosed();
+                    await WaitAsync(cancellationToken).ConfigureAwait(false);
+                    Log.RetryingSendAsync(Logger, _configuration.Address);
+                }
+                catch (ObjectDisposedException) when (!ReferenceEquals(producer, _producer))
                 {
                     HandleProducerClosed();
                     await WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -50,11 +57,19 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
             while (true)
             {
                 CheckState();
+                var producer = _producer;
 
                 try
                 {
-                    _producer.Send(message, cancellationToken);
+                    producer.Send(message, cancellationToken);
                     return;
+                }
+                catch (ProducerClosedException e) when (IsTerminalProducerException(e))
+                {
+                    TerminateAsync(e).GetAwaiter().GetResult();
+
+                    // Producer cannot be recovered for terminal broker-side close reasons.
+                    throw;
                 }
                 catch (ProducerClosedException)
                 {
@@ -62,7 +77,18 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
                     Wait(cancellationToken);
                     Log.RetryingSendAsync(Logger, _configuration.Address);
                 }
+                catch (ObjectDisposedException) when (!ReferenceEquals(producer, _producer))
+                {
+                    HandleProducerClosed();
+                    Wait(cancellationToken);
+                    Log.RetryingSendAsync(Logger, _configuration.Address);
+                }
             }
+        }
+
+        private static bool IsTerminalProducerException(ProducerClosedException exception)
+        {
+            return exception.ErrorCode is ErrorCode.UnauthorizedAccess or ErrorCode.NotFound;
         }
 
         protected override IAsyncDisposable UnderlyingResource => _producer;
