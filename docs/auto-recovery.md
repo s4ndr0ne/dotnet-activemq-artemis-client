@@ -33,6 +33,25 @@ When the client library successfully reestablishes the connection, `IConnection.
 
 To retry indefinite amount of times `RetryCount` should return `int.MaxValue`.
 
+## Consumer recovery
+
+Consumers are recovered independently from connections. If a consumer link is closed
+by the broker — including `ResourceDeleted` (queue deleted) or `NotFound`
+(queue not yet recreated) — the consumer is suspended and recreated with the same
+`IRecoveryPolicy` backoff. With the default policy (`RecoveryPolicyFactory.Default()`,
+unlimited retries) this waits indefinitely for the queue to reappear instead of throwing.
+
+> **Breaking change:** `ResourceDeleted` no longer terminates the consumer with a
+> terminal `ConsumerClosedException`. `ReceiveAsync` now waits for recovery
+> (cancellable via the passed `CancellationToken`). When `RetryCount` is exceeded
+> the consumer is terminated (`ConsumerLifecycleState.RecoveryFailed`) and health
+> checks report `Unhealthy`. Use `IConsumerLifecycleEvents.ConsumerStateChanged`
+> and `DisposeAsync` to observe or stop waiting.
+
+Hosted (`AddConsumer`) consumers retry indefinitely with backoff
+(configurable via `ConsumerOptions.RecoveryPolicy`) and are never terminated
+silently: the background loop stays alive until `StopAsync`.
+
 :::tip
 
 If the initial connection to an Artemis node fails, automatic connection recovery will kick in as well. It may be problematic in some scenarios, as `ConnectionFactory.CreateAsync` won't signal any issues until the recovery policy gives up. If your recovery policy is configured to try to recover forever it may even never happen. That means you would be asynchronously waiting for the result of `CreateAsync` forever. To address this issue you can pass `CancellationToken` to `CreateAsync`. This allows you to arbitrarily break the operation at any point.

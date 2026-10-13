@@ -53,6 +53,13 @@ namespace ActiveMQ.Artemis.Client
 
         public ILoggerFactory LoggerFactory { get; set; } = new NullLoggerFactory();
         public bool AutomaticRecoveryEnabled { get; set; } = true;
+        /// <summary>
+        /// Recovery policy for connections and consumers. Consumers that cannot be
+        /// recreated (e.g. deleted queue) are retried with backoff until
+        /// <see cref="AutoRecovering.RecoveryPolicy.IRecoveryPolicy.RetryCount"/> is exceeded,
+        /// then terminated. Set <see cref="AutoRecovering.RecoveryPolicy.IRecoveryPolicy.RetryCount"/>
+        /// to <c>int.MaxValue</c> (the default) to wait indefinitely for the resource to reappear.
+        /// </summary>
         public IRecoveryPolicy RecoveryPolicy
         {
             get => _recoveryPolicy ?? RecoveryPolicyFactory.Default();

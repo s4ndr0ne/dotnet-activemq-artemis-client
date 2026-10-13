@@ -13,9 +13,10 @@ This lightweight .NET client library built on top of [AmqpNetLite](http://azure.
 |ArtemisNetClient|[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.svg)](https://www.nuget.org/packages/ArtemisNetClient/)
 |ArtemisNetClient.Extensions.DependencyInjection|[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Extensions.DependencyInjection.svg)](https://www.nuget.org/packages/ArtemisNetClient.Extensions.DependencyInjection/)
 |ArtemisNetClient.Extensions.Hosting |[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Extensions.Hosting.svg)](https://www.nuget.org/packages/ArtemisNetClient.Extensions.Hosting/)
+|ArtemisNetClient.Extensions.HealthChecks|[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Extensions.HealthChecks.svg)](https://www.nuget.org/packages/ArtemisNetClient.Extensions.HealthChecks/)
 |ArtemisNetClient.Extensions.App.Metrics |[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Extensions.App.Metrics.svg)](https://www.nuget.org/packages/ArtemisNetClient.Extensions.App.Metrics/)
 |ArtemisNetClient.Extensions.CloudEvents|[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Extensions.CloudEvents.svg)](https://www.nuget.org/packages/ArtemisNetClient.Extensions.CloudEvents/)
-|ArtemisNetClient.Extensions.LeaderElection |
+|ArtemisNetClient.Extensions.LeaderElection |[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Extensions.LeaderElection.svg)](https://www.nuget.org/packages/ArtemisNetClient.Extensions.LeaderElection/)
 |ArtemisNetClient.Testing|[![NuGet](https://img.shields.io/nuget/vpre/ArtemisNetClient.Testing.svg)](https://www.nuget.org/packages/ArtemisNetClient.Testing/)
 
 ## Commercial support
@@ -78,7 +79,17 @@ Detailed documentation is available on [the project website](https://havret.gith
 
 - [Getting Started](docs/getting-started.md)
 - [Dependency Injection](docs/dependency-injection.md)
+- [Automatic Recovery](docs/auto-recovery.md)
+- [Connection Lifecycle](docs/connection-lifecycle.md)
+- [Messaging Model](docs/messaging-model.md)
 - [Request Reply](docs/request-reply.md)
+- [Transactions](docs/transactions.md)
+- [Message Acknowledgment](docs/message-acknowledgment.md)
+- [Consumer Credit](docs/consumer-credit.md)
+- [Message Filtering](docs/message-filtering.md)
+- [Message Payload](docs/message-payload.md)
+- [Message Priority](docs/message-priority.md)
+- [Message Durability](docs/message-durability.md)
 - [Testing](docs/testing.md)
 
 ## Online resources
@@ -149,8 +160,11 @@ There are several extensions available that make integration of .NET Client for 
 
 - `ArtemisNetClient.Extensions.DependencyInjection`: registers connections, consumers, producers, request-reply clients, and topology configuration in `IServiceCollection`. Start here for ASP.NET Core. See [Dependency Injection](docs/dependency-injection.md).
 - `ArtemisNetClient.Extensions.Hosting`: starts Artemis registrations through `IHostedService`. Used together with the DI package in hosted apps.
-- `ArtemisNetClient.Extensions.HealthChecks`: exposes Artemis connectivity through ASP.NET Core health checks.
+- `ArtemisNetClient.Extensions.HealthChecks`: exposes Artemis connectivity through ASP.NET Core health checks. Reports `Unhealthy` when the connection is down or any consumer is unavailable. See [Automatic Recovery](docs/auto-recovery.md).
 - `ArtemisNetClient.Extensions.LeaderElection`: adds distributed leader election on top of the DI and hosting integration.
+- `ArtemisNetClient.Extensions.App.Metrics`: records messaging metrics (sent/received messages) for observability dashboards.
+- `ArtemisNetClient.Extensions.CloudEvents`: CloudEvents bindings for Artemis messages.
+- `ArtemisNetClient.Testing`: in-memory test harness for messaging-dependent code. See [Testing](docs/testing.md).
 
 Examples:
 

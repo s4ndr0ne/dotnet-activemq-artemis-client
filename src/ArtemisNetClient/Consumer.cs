@@ -109,8 +109,11 @@ namespace ActiveMQ.Artemis.Client
         {
             var consumerClosedException = GetConsumerClosedException(error);
             Log.ConsumerClosed(_logger, _receiverLink, consumerClosedException);
+            LifecycleChanged?.Invoke(this, new ConsumerLifecycleEventArgs(this, ConsumerLifecycleState.Unavailable, consumerClosedException));
             _writer.TryComplete(consumerClosedException);
         }
+
+        internal event EventHandler<ConsumerLifecycleEventArgs> LifecycleChanged;
 
         private static ConsumerClosedException GetConsumerClosedException(Error error)
         {
@@ -148,6 +151,7 @@ namespace ActiveMQ.Artemis.Client
             {
                 _writer.TryComplete();
                 _disposed = true;
+                LifecycleChanged?.Invoke(this, new ConsumerLifecycleEventArgs(this, ConsumerLifecycleState.Disposed));
             }
         }
 

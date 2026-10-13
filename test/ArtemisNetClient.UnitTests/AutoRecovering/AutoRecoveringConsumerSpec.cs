@@ -156,103 +156,275 @@ namespace ActiveMQ.Artemis.Client.UnitTests.AutoRecovering
         }
 
         [Fact]
-        public async Task Throws_on_receive_when_resource_deleted()
+        public async Task Waits_for_resource_deleted_consumer_to_become_available_and_recreates_it()
         {
             var host = CreateOpenedContainerHost();
             var linkProcessor = host.CreateTestLinkProcessor();
+            var unavailable = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var recovered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var retryStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var attachCount = 0;
+            var queueAvailable = 0;
+            ListenerLink initialLink = null;
 
-            ListenerLink listenerLink = null;
             linkProcessor.SetHandler(context =>
             {
-                listenerLink = context.Link;
-                return false;
+                var attempt = Interlocked.Increment(ref attachCount);
+                if (attempt == 1)
+                {
+                    initialLink = context.Link;
+                    return false;
+                }
+
+                retryStarted.TrySetResult(true);
+                if (Volatile.Read(ref queueAvailable) == 0)
+                {
+                    context.Complete(new Error(ErrorCode.NotFound) { Description = "Queue: 'a1' does not exist" });
+                    return true;
+                }
+
+                context.Complete(new TestLinkEndpoint(), context.Attach.Role ? 0 : 30);
+                return true;
             });
 
-            await using var connection = await CreateConnection(host.Endpoint);
+            var connectionFactory = CreateConnectionFactory();
+            connectionFactory.RecoveryPolicy = RecoveryPolicyFactory.ConstantBackoff(TimeSpan.FromMilliseconds(20));
+            await using var connection = await connectionFactory.CreateAsync(host.Endpoint);
+            ((IConsumerLifecycleEvents)connection).ConsumerStateChanged += (_, args) =>
+            {
+                if (args.State == ConsumerLifecycleState.Unavailable)
+                {
+                    unavailable.TrySetResult(true);
+                }
+                else if (args.State == ConsumerLifecycleState.Recovered)
+                {
+                    recovered.TrySetResult(true);
+                }
+            };
 
-            var consumer = await connection.CreateConsumerAsync("a1", RoutingType.Anycast);
+            await using var consumer = await connection.CreateConsumerAsync("a1", RoutingType.Anycast);
+            using var cancellation = new CancellationTokenSource(Timeout);
+            var receiveTask = consumer.ReceiveAsync(cancellation.Token);
 
-            var receiveTask = consumer.ReceiveAsync(CancellationToken);
-            
             try
             {
-                await listenerLink.CloseAsync(Timeout, new Error(ErrorCode.ResourceDeleted) { Description = "Queue was deleted: a1" });
+                await initialLink.CloseAsync(Timeout, new Error(ErrorCode.ResourceDeleted) { Description = "Queue was deleted: a1" });
             }
             catch (Exception)
             {
-                // ignored
             }
 
-            await Assert.ThrowsAsync<ConsumerClosedException>(async () => await receiveTask);
+            await unavailable.Task.WaitAsync(Timeout);
+            await retryStarted.Task.WaitAsync(Timeout);
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+            Assert.False(recovered.Task.IsCompleted);
+
+            Volatile.Write(ref queueAvailable, 1);
+            await recovered.Task.WaitAsync(Timeout);
+            Assert.True(Volatile.Read(ref attachCount) >= 3);
+
+            cancellation.Cancel();
+            await Assert.ThrowsAsync<TaskCanceledException>(async () => await receiveTask);
         }
 
         [Fact]
-        public async Task Should_not_recreate_consumer_when_resource_deleted()
+        public async Task Duplicate_close_signals_are_coalesced_into_single_recovery()
         {
-            var host1 = CreateOpenedContainerHost();
-            var host2 = CreateContainerHost();
-            var host3 = CreateContainerHost();
-            
-            ListenerLink listenerLink1 = null;
-            host1.CreateTestLinkProcessor().SetHandler(context =>
+            var host = CreateOpenedContainerHost();
+            var linkProcessor = host.CreateTestLinkProcessor();
+            var attachCount = 0;
+            var unavailableCount = 0;
+            var recoveredCount = 0;
+            ListenerLink initialLink = null;
+
+            linkProcessor.SetHandler(context =>
             {
-                listenerLink1 = context.Link;
-                return false;
+                var attempt = Interlocked.Increment(ref attachCount);
+                if (attempt == 1)
+                {
+                    initialLink = context.Link;
+                    return false;
+                }
+
+                context.Complete(new TestLinkEndpoint(), context.Attach.Role ? 0 : 30);
+                return true;
             });
 
-            await using var connection = await CreateConnection(new[] { host1.Endpoint, host2.Endpoint, host3.Endpoint });
+            var connectionFactory = CreateConnectionFactory();
+            connectionFactory.RecoveryPolicy = RecoveryPolicyFactory.ConstantBackoff(TimeSpan.FromMilliseconds(20));
+            await using var connection = await connectionFactory.CreateAsync(host.Endpoint);
+            ((IConsumerLifecycleEvents)connection).ConsumerStateChanged += (_, args) =>
+            {
+                if (args.State == ConsumerLifecycleState.Unavailable)
+                {
+                    Interlocked.Increment(ref unavailableCount);
+                }
+                else if (args.State == ConsumerLifecycleState.Recovered)
+                {
+                    Interlocked.Increment(ref recoveredCount);
+                }
+            };
 
-            var consumer = await connection.CreateConsumerAsync("a1", RoutingType.Anycast);
-
-            var receiveTask = consumer.ReceiveAsync(CancellationToken);
+            await using var consumer = await connection.CreateConsumerAsync("a1", RoutingType.Anycast);
+            using var cancellation = new CancellationTokenSource(Timeout);
+            // Hold ReceiveAsync so both the channel-completion path and the
+            // underlying-link lifecycle event fire for the same close.
+            var receiveTask = consumer.ReceiveAsync(cancellation.Token);
 
             try
             {
-                await listenerLink1.CloseAsync(Timeout, new Error(ErrorCode.ResourceDeleted) { Description = "Queue was deleted: a1" });
+                await initialLink.CloseAsync(Timeout, new Error(ErrorCode.ResourceDeleted) { Description = "Queue was deleted: a1" });
             }
             catch (Exception)
             {
-                // ignored
             }
 
-            await Assert.ThrowsAsync<ConsumerClosedException>(async () => await receiveTask);
-
-            await DisposeHostAndWaitUntilConnectionNotified(host1, connection);
-
-            var waitUntilConnectionRecoveredTask = WaitUntilConnectionRecovered(connection);
-
-            host2.CreateTestLinkProcessor().SetHandler(context =>
+            // Wait for recovery, then give duplicates a chance to cause extra attaches.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (Volatile.Read(ref recoveredCount) == 0 && DateTime.UtcNow < deadline)
             {
+                await Task.Delay(20);
+            }
+
+            Assert.Equal(1, Volatile.Read(ref recoveredCount));
+            await Task.Delay(200);
+            Assert.Equal(1, Volatile.Read(ref unavailableCount));
+            Assert.Equal(2, Volatile.Read(ref attachCount));
+
+            cancellation.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(async () => await receiveTask);
+        }
+
+        [Fact]
+        public async Task Dispose_during_consumer_backoff_cancels_recovery()
+        {
+            var host = CreateOpenedContainerHost();
+            var linkProcessor = host.CreateTestLinkProcessor();
+            var attachCount = 0;
+            var unavailable = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            ListenerLink initialLink = null;
+
+            linkProcessor.SetHandler(context =>
+            {
+                var attempt = Interlocked.Increment(ref attachCount);
+                if (attempt == 1)
+                {
+                    initialLink = context.Link;
+                    return false;
+                }
+
                 context.Complete(new Error(ErrorCode.NotFound) { Description = "Queue: 'a1' does not exist" });
                 return true;
             });
-            host2.Open();
 
-            // wait until the connection recovered
-            await waitUntilConnectionRecoveredTask;
-            
-            // make sure that the consumer remains closed
-            await Assert.ThrowsAsync<ConsumerClosedException>(async () => await consumer.ReceiveAsync(CancellationToken));
-
-            // perform again auto-recovery cycle, to make sure that
-            // no further attempts to recover the consumer will be made
-            await DisposeHostAndWaitUntilConnectionNotified(host2, connection);
-            
-            waitUntilConnectionRecoveredTask = WaitUntilConnectionRecovered(connection);
-            
-            ListenerLink listenerLink3 = null;
-            host3.CreateTestLinkProcessor().SetHandler(context =>
+            var connectionFactory = CreateConnectionFactory();
+            connectionFactory.RecoveryPolicy = RecoveryPolicyFactory.ConstantBackoff(TimeSpan.FromSeconds(30));
+            await using var connection = await connectionFactory.CreateAsync(host.Endpoint);
+            ((IConsumerLifecycleEvents)connection).ConsumerStateChanged += (_, args) =>
             {
-                listenerLink3 = context.Link;
-                return false;
+                if (args.State == ConsumerLifecycleState.Unavailable)
+                {
+                    unavailable.TrySetResult(true);
+                }
+            };
+
+            var consumer = await connection.CreateConsumerAsync("a1", RoutingType.Anycast);
+            using var cancellation = new CancellationTokenSource(Timeout);
+            var receiveTask = consumer.ReceiveAsync(cancellation.Token);
+
+            try
+            {
+                await initialLink.CloseAsync(Timeout, new Error(ErrorCode.ResourceDeleted) { Description = "Queue was deleted: a1" });
+            }
+            catch (Exception)
+            {
+            }
+
+            await unavailable.Task.WaitAsync(Timeout);
+
+            // Wait until the first recovery attempt has failed (second attach with
+            // NotFound) so the 30s backoff is pending. Disposing must cancel the
+            // pending retry, not wait for it.
+            var deadline = DateTime.UtcNow + Timeout;
+            while (Volatile.Read(ref attachCount) < 2 && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(20);
+            }
+
+            Assert.True(Volatile.Read(ref attachCount) >= 2);
+            await Task.Delay(200);
+
+            // Dispose must not wait for the 30s backoff.
+            var disposeTask = consumer.DisposeAsync().AsTask();
+            var completed = await Task.WhenAny(disposeTask, Task.Delay(Timeout));
+            Assert.Same(disposeTask, completed);
+            await disposeTask;
+
+            var attachesAfterDispose = Volatile.Read(ref attachCount);
+            await Task.Delay(300);
+            Assert.Equal(attachesAfterDispose, Volatile.Read(ref attachCount));
+
+            cancellation.Cancel();
+            try
+            {
+                await receiveTask;
+            }
+            catch (Exception)
+            {
+                // Receive unblocks with cancellation or disposal; either is acceptable here.
+            }
+
+            await connection.DisposeAsync();
+            host.Dispose();
+        }
+
+        [Fact]
+        public async Task Recovery_policy_give_up_terminates_consumer()
+        {
+            var host = CreateOpenedContainerHost();
+            var linkProcessor = host.CreateTestLinkProcessor();
+            var recoveryFailed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            ListenerLink initialLink = null;
+            var attachCount = 0;
+
+            linkProcessor.SetHandler(context =>
+            {
+                var attempt = Interlocked.Increment(ref attachCount);
+                if (attempt == 1)
+                {
+                    initialLink = context.Link;
+                    return false;
+                }
+
+                context.Complete(new Error(ErrorCode.NotFound) { Description = "Queue: 'a1' does not exist" });
+                return true;
             });
-            host3.Open();
-            
-            // wait until the connection recovered
-            await waitUntilConnectionRecoveredTask;
-            
-            // make sure that no listener link was created on the final host
-            Assert.Null(listenerLink3);
+
+            var connectionFactory = CreateConnectionFactory();
+            connectionFactory.RecoveryPolicy = RecoveryPolicyFactory.ConstantBackoff(TimeSpan.FromMilliseconds(20), retryCount: 1);
+            await using var connection = await connectionFactory.CreateAsync(host.Endpoint);
+            ((IConsumerLifecycleEvents)connection).ConsumerStateChanged += (_, args) =>
+            {
+                if (args.State == ConsumerLifecycleState.RecoveryFailed)
+                {
+                    recoveryFailed.TrySetResult(true);
+                }
+            };
+
+            await using var consumer = await connection.CreateConsumerAsync("a1", RoutingType.Anycast);
+            using var cancellation = new CancellationTokenSource(Timeout);
+            var receiveTask = consumer.ReceiveAsync(cancellation.Token);
+
+            try
+            {
+                await initialLink.CloseAsync(Timeout, new Error(ErrorCode.ResourceDeleted) { Description = "Queue was deleted: a1" });
+            }
+            catch (Exception)
+            {
+            }
+
+            await recoveryFailed.Task.WaitAsync(Timeout);
+            await Assert.ThrowsAsync<ConsumerClosedException>(async () => await receiveTask);
         }
 
         [Fact]

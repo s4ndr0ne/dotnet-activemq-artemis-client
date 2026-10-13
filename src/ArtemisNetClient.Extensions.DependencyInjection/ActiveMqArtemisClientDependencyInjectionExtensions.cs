@@ -168,7 +168,7 @@ namespace ActiveMQ.Artemis.Client.Extensions.DependencyInjection
                 {
                     observable.Address = address;
                     observable.RoutingType = routingType;
-                }, handler);
+                }, handler, consumerOptions.RecoveryPolicy);
             }
 
             return builder;
@@ -275,7 +275,7 @@ namespace ActiveMQ.Artemis.Client.Extensions.DependencyInjection
                     observable.Address = address;
                     observable.RoutingType = routingType;
                     observable.Queue = queue;
-                }, handler);
+                }, handler, consumerOptions.RecoveryPolicy);
             }
 
             return builder;
@@ -321,7 +321,7 @@ namespace ActiveMQ.Artemis.Client.Extensions.DependencyInjection
                     observable.Address = address;
                     observable.RoutingType = RoutingType.Multicast;
                     observable.Queue = queue;
-                }, handler);
+                }, handler, consumerOptions.RecoveryPolicy);
             }
 
             return builder;
@@ -368,7 +368,7 @@ namespace ActiveMQ.Artemis.Client.Extensions.DependencyInjection
                     observable.Address = address;
                     observable.RoutingType = RoutingType.Multicast;
                     observable.Queue = queue;
-                }, handler);
+                }, handler, consumerOptions.RecoveryPolicy);
             }
 
             return builder;
@@ -377,7 +377,8 @@ namespace ActiveMQ.Artemis.Client.Extensions.DependencyInjection
         private static void AddConsumer(this IActiveMqBuilder builder,
             ConsumerConfiguration consumerConfiguration,
             Action<ContextualReceiveObservable> configureContextualReceiveObservableAction,
-            Func<Message, IConsumer, IServiceProvider, CancellationToken, Task> handler)
+            Func<Message, IConsumer, IServiceProvider, CancellationToken, Task> handler,
+            AutoRecovering.RecoveryPolicy.IRecoveryPolicy recoveryPolicy = null)
         {
             builder.Services.AddSingleton(provider =>
             {
@@ -388,7 +389,7 @@ namespace ActiveMQ.Artemis.Client.Extensions.DependencyInjection
                 {
                     var connection = await provider.GetConnection(builder.Name, token).ConfigureAwait(false);
                     return await connection.CreateConsumerAsync(consumerConfiguration, token).ConfigureAwait(false);
-                }, handler);
+                }, handler, recoveryPolicy);
             });
         }
 

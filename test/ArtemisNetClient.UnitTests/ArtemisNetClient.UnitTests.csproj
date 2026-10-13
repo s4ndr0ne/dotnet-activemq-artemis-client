@@ -6,6 +6,8 @@
     
   <ItemGroup>
     <ProjectReference Include="..\..\src\ArtemisNetClient\ArtemisNetClient.csproj" />
+    <ProjectReference Include="..\..\src\ArtemisNetClient.Extensions.DependencyInjection\ArtemisNetClient.Extensions.DependencyInjection.csproj" />
+    <ProjectReference Include="..\..\src\ArtemisNetClient.Extensions.HealthChecks\ArtemisNetClient.Extensions.HealthChecks.csproj" />
     <ProjectReference Include="..\ArtemisNetClient.TestUtils\ArtemisNetClient.TestUtils.csproj" />
   </ItemGroup>
 

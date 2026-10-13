@@ -36,6 +36,11 @@ namespace ActiveMQ.Artemis.Client.Extensions.HealthChecks
                 connection.ConnectionClosed += (sender, args) => healthCheckService.ConnectionClosed(sender, args);
                 connection.ConnectionRecovered += (sender, args) => healthCheckService.ConnectionRecovered(sender, args);
                 connection.ConnectionRecoveryError += (sender, args) => healthCheckService.ConnectionRecoveryError(sender, args);
+
+                if (connection is IConsumerLifecycleEvents consumerLifecycleEvents)
+                {
+                    consumerLifecycleEvents.ConsumerStateChanged += healthCheckService.ConsumerStateChanged;
+                }
             });
 
             return builder.Add(new HealthCheckRegistration(

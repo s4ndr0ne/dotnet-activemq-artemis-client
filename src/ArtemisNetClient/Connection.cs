@@ -11,7 +11,7 @@ using Microsoft.Extensions.Logging;
 
 namespace ActiveMQ.Artemis.Client
 {
-    internal class Connection : IConnection
+    internal class Connection : IConnection, IConsumerLifecycleEvents
     {
         private readonly Amqp.Connection _connection;
         private readonly Func<IMessageIdPolicy> _messageIdPolicyFactory;
@@ -62,7 +62,13 @@ namespace ActiveMQ.Artemis.Client
 
             var session = await CreateSession(cancellationToken).ConfigureAwait(false);
             var consumerBuilder = new ConsumerBuilder(_loggerFactory, _transactionsManager, session);
-            return await consumerBuilder.CreateAsync(configuration, cancellationToken).ConfigureAwait(false);
+            var consumer = await consumerBuilder.CreateAsync(configuration, cancellationToken).ConfigureAwait(false);
+            if (consumer is Consumer concreteConsumer)
+            {
+                concreteConsumer.LifecycleChanged += (_, args) => ConsumerStateChanged?.Invoke(this, args);
+            }
+
+            return consumer;
         }
 
         public async Task<IProducer> CreateProducerAsync(ProducerConfiguration configuration, CancellationToken cancellationToken)
@@ -195,5 +201,6 @@ namespace ActiveMQ.Artemis.Client
         public event EventHandler<ConnectionRecoveredEventArgs> ConnectionRecovered;
         public event EventHandler<ConnectionRecoveryErrorEventArgs> ConnectionRecoveryError;
 #pragma warning restore CS0067
+        public event EventHandler<ConsumerLifecycleEventArgs> ConsumerStateChanged;
     }
 }

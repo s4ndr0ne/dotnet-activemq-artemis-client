@@ -18,5 +18,14 @@
         public string FilterExpression { get; set; }
 
         public bool NoLocalFilter { get; set; }
+
+        /// <summary>
+        /// Recovery policy used by the hosted consumer to recreate its
+        /// <see cref="IConsumer"/> after <see cref="Exceptions.ConsumerClosedException"/>.
+        /// Retries indefinitely with backoff; attempt is clamped to
+        /// <see cref="AutoRecovering.RecoveryPolicy.IRecoveryPolicy.RetryCount"/> so the delay stays bounded.
+        /// Default is <see cref="AutoRecovering.RecoveryPolicy.RecoveryPolicyFactory.Default"/>.
+        /// </summary>
+        public AutoRecovering.RecoveryPolicy.IRecoveryPolicy RecoveryPolicy { get; set; }
     }
 }

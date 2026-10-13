@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -16,7 +17,7 @@ using Polly.Retry;
 
 namespace ActiveMQ.Artemis.Client.AutoRecovering
 {
-    internal class AutoRecoveringConnection : IConnection
+    internal class AutoRecoveringConnection : IConnection, IConsumerLifecycleEvents
     {
         private IConnection _connection;
         private readonly ILoggerFactory _loggerFactory;
@@ -29,7 +30,11 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
         private readonly ChannelReader<ConnectCommand> _reader;
         private readonly ChannelWriter<ConnectCommand> _writer;
         private readonly ConcurrentHashSet<IRecoverable> _recoverables = new();
+        private readonly ConcurrentDictionary<AutoRecoveringConsumer, int> _consumerRecoveryAttempts = new();
+        private readonly ConcurrentDictionary<AutoRecoveringConsumer, byte> _scheduledConsumerRecoveries = new();
+        private readonly ConcurrentDictionary<AutoRecoveringConsumer, byte> _consumerRecoveryInFlight = new();
         private readonly CancellationTokenSource _recoveryCancellationToken = new();
+        private readonly IRecoveryPolicy _recoveryPolicy;
         private readonly AsyncRetryPolicy<IConnection> _connectionRetryPolicy;
         private readonly Task _recoveryLoopTask;
 
@@ -48,6 +53,7 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
             _sslSettings = sslSettings;
             _tcpSettings = tcpSettings;
             _endpoints = endpoints.ToArray();
+            _recoveryPolicy = recoveryPolicy;
 
             var channel = Channel.CreateUnbounded<ConnectCommand>();
             _reader = channel.Reader;
@@ -94,7 +100,17 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
                 {
                     while (true)
                     {
-                        await _reader.ReadAsync(_recoveryCancellationToken.Token).ConfigureAwait(false);
+                        var command = await _reader.ReadAsync(_recoveryCancellationToken.Token).ConfigureAwait(false);
+
+                        if (command.Consumer != null)
+                        {
+                            if (IsOpened)
+                            {
+                                await TryRecoverConsumerAsync(command.Consumer).ConfigureAwait(false);
+                            }
+
+                            continue;
+                        }
 
                         if (!IsOpened)
                         {
@@ -106,9 +122,16 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
                             }
 
                             _connection = await CreateConnection(_recoveryCancellationToken.Token).ConfigureAwait(false);
+                            _connection.ConnectionClosed += OnConnectionClosed;
 
                             foreach (var recoverable in _recoverables.Values)
                             {
+                                if (recoverable is AutoRecoveringConsumer consumer)
+                                {
+                                    await TryRecoverConsumerAsync(consumer, forceRecovery: true).ConfigureAwait(false);
+                                    continue;
+                                }
+
                                 try
                                 {
                                     await recoverable.RecoverAsync(_connection, _recoveryCancellationToken.Token).ConfigureAwait(false);
@@ -120,18 +143,22 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
                                 }
                             }
 
-                            _connection.ConnectionClosed += OnConnectionClosed;
-
                             Log.ConnectionRecovered(_logger);
 
                             ConnectionRecovered?.Invoke(this, new ConnectionRecoveredEventArgs(_connection.Endpoint));
                         }
                         else
                         {
-                            // If the connection is already opened it means that there may be some suspended recoverables that need to be resumed
                             foreach (var recoverable in _recoverables.Values)
                             {
-                                recoverable.Resume();
+                                if (recoverable is AutoRecoveringConsumer consumer && consumer.IsConsumerUnavailable)
+                                {
+                                    await TryRecoverConsumerAsync(consumer).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    recoverable.Resume();
+                                }
                             }
                         }
                     }
@@ -150,6 +177,132 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
                     }
 
                     ConnectionRecoveryError?.Invoke(this, new ConnectionRecoveryErrorEventArgs(e));
+                }
+            });
+        }
+
+        private async Task TryRecoverConsumerAsync(AutoRecoveringConsumer consumer, bool forceRecovery = false)
+        {
+            if (consumer.IsTerminatedOrDisposed)
+            {
+                CleanupConsumerState(consumer);
+                return;
+            }
+
+            // Serialize recovery per consumer: the recovery loop is single-threaded, but
+            // ReceiveAsync failures and underlying-link lifecycle events can enqueue
+            // duplicate commands for the same close. Coalesce them instead of running
+            // overlapping RecoverAsync calls.
+            if (!_consumerRecoveryInFlight.TryAdd(consumer, byte.MinValue))
+            {
+                return;
+            }
+
+            try
+            {
+                if (!forceRecovery && !consumer.IsConsumerUnavailable)
+                {
+                    consumer.Resume();
+                    return;
+                }
+
+                try
+                {
+                    await consumer.RecoverAsync(_connection, _recoveryCancellationToken.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (_recoveryCancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    consumer.NotifyConsumerUnavailable(exception);
+                    _logger.LogWarning(exception, "Failed to recreate consumer; retrying with backoff.");
+                    ScheduleConsumerRecovery(consumer, exception);
+                    return;
+                }
+
+                if (consumer.IsTerminatedOrDisposed)
+                {
+                    CleanupConsumerState(consumer);
+                    return;
+                }
+
+                if (consumer.IsConsumerUnavailable)
+                {
+                    // A new failure arrived while recreating: schedule a retry instead of resuming.
+                    ScheduleConsumerRecovery(consumer, new ConsumerClosedException("Consumer became unavailable during recovery.", (string)null));
+                    return;
+                }
+
+                consumer.Resume();
+                _consumerRecoveryAttempts.TryRemove(consumer, out _);
+            }
+            finally
+            {
+                _consumerRecoveryInFlight.TryRemove(consumer, out _);
+            }
+        }
+
+        private void ScheduleConsumerRecovery(AutoRecoveringConsumer consumer, Exception failure)
+        {
+            if (consumer.IsTerminatedOrDisposed || !consumer.IsConsumerUnavailable || !_scheduledConsumerRecoveries.TryAdd(consumer, byte.MinValue))
+            {
+                return;
+            }
+
+            var attempt = _consumerRecoveryAttempts.AddOrUpdate(consumer, 1, (_, previous) => previous >= int.MaxValue ? int.MaxValue : previous + 1);
+            if (attempt > _recoveryPolicy.RetryCount)
+            {
+                // Recovery policy gave up: terminate the consumer so ReceiveAsync throws
+                // ConsumerClosedException instead of waiting forever. Health checks observe
+                // RecoveryFailed via ConsumerStateChanged.
+                _scheduledConsumerRecoveries.TryRemove(consumer, out _);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await consumer.TerminateAsync(failure).ConfigureAwait(false);
+                    }
+                    catch (Exception exception)
+                    {
+                        _logger.LogError(exception, "Failed to terminate consumer after recovery policy gave up.");
+                    }
+                    finally
+                    {
+                        CleanupConsumerState(consumer);
+                    }
+                });
+                return;
+            }
+
+            var delay = _recoveryPolicy.GetDelay(attempt);
+            var maxDelay = TimeSpan.FromMilliseconds(int.MaxValue);
+            if (delay > maxDelay)
+            {
+                delay = maxDelay;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(delay, _recoveryCancellationToken.Token).ConfigureAwait(false);
+                    _scheduledConsumerRecoveries.TryRemove(consumer, out _);
+
+                    if (!consumer.IsTerminatedOrDisposed && consumer.IsConsumerUnavailable)
+                    {
+                        _writer.TryWrite(ConnectCommand.ForConsumer(consumer));
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _scheduledConsumerRecoveries.TryRemove(consumer, out _);
+                }
+                catch (Exception exception)
+                {
+                    _scheduledConsumerRecoveries.TryRemove(consumer, out _);
+                    _logger.LogError(exception, "Consumer recovery retry could not be scheduled.");
                 }
             });
         }
@@ -235,10 +388,32 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
         public event EventHandler<ConnectionClosedEventArgs> ConnectionClosed;
         public event EventHandler<ConnectionRecoveredEventArgs> ConnectionRecovered;
         public event EventHandler<ConnectionRecoveryErrorEventArgs> ConnectionRecoveryError;
+        public event EventHandler<ConsumerLifecycleEventArgs> ConsumerStateChanged;
 
         private async Task PrepareRecoverable(IRecoverable recoverable, CancellationToken cancellationToken)
         {
-            await recoverable.RecoverAsync(_connection, cancellationToken).ConfigureAwait(false);
+            var consumer = recoverable as AutoRecoveringConsumer;
+            if (consumer != null)
+            {
+                consumer.ConsumerStateChanged += OnConsumerStateChanged;
+                consumer.ConsumerRecoveryRequested += OnConsumerRecoveryRequested;
+            }
+
+            try
+            {
+                await recoverable.RecoverAsync(_connection, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                if (consumer != null)
+                {
+                    consumer.ConsumerStateChanged -= OnConsumerStateChanged;
+                    consumer.ConsumerRecoveryRequested -= OnConsumerRecoveryRequested;
+                }
+
+                throw;
+            }
+
             _recoverables.Add(recoverable);
             recoverable.Closed += OnRecoverableClosed;
             recoverable.RecoveryRequested += OnRecoveryRequested;
@@ -248,7 +423,30 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
         {
             recoverable.Closed -= OnRecoverableClosed;
             recoverable.RecoveryRequested -= OnRecoveryRequested;
+            if (recoverable is AutoRecoveringConsumer consumer)
+            {
+                consumer.ConsumerStateChanged -= OnConsumerStateChanged;
+                consumer.ConsumerRecoveryRequested -= OnConsumerRecoveryRequested;
+                CleanupConsumerState(consumer);
+            }
             _recoverables.Remove(recoverable);
+        }
+
+        private void CleanupConsumerState(AutoRecoveringConsumer consumer)
+        {
+            _consumerRecoveryAttempts.TryRemove(consumer, out _);
+            _scheduledConsumerRecoveries.TryRemove(consumer, out _);
+            _consumerRecoveryInFlight.TryRemove(consumer, out _);
+        }
+
+        private void OnConsumerStateChanged(ConsumerLifecycleEventArgs args)
+        {
+            ConsumerStateChanged?.Invoke(this, args);
+        }
+
+        private void OnConsumerRecoveryRequested(AutoRecoveringConsumer consumer)
+        {
+            _writer.TryWrite(ConnectCommand.ForConsumer(consumer));
         }
 
         private void OnRecoveryRequested()
@@ -266,10 +464,16 @@ namespace ActiveMQ.Artemis.Client.AutoRecovering
 
         private async Task DisposeInnerConnection()
         {
-            _connection.ConnectionClosed -= OnConnectionClosed;
+            var connection = _connection;
+            if (connection == null)
+            {
+                return;
+            }
+
+            connection.ConnectionClosed -= OnConnectionClosed;
             try
             {
-                await _connection.DisposeAsync().ConfigureAwait(false);
+                await connection.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception)
             {

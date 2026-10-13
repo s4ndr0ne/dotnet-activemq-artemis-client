@@ -1,6 +1,6 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
-using ActiveMQ.Artemis.Client.Exceptions;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -57,6 +57,15 @@ namespace ActiveMQ.Artemis.Client.IntegrationTests.TopologyManagement
             
             var consumer = await connection.CreateConsumerAsync(address, queue, CancellationToken);
 
+            var consumerUnavailable = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            ((IConsumerLifecycleEvents)connection).ConsumerStateChanged += (_, args) =>
+            {
+                if (args.State == ConsumerLifecycleState.Unavailable)
+                {
+                    consumerUnavailable.TrySetResult(true);
+                }
+            };
+
             await topologyManager.DeleteAddressAsync(address, force: true, cancellationToken: CancellationToken);
 
             var addressNames = await topologyManager.GetAddressNamesAsync(CancellationToken);
@@ -65,7 +74,15 @@ namespace ActiveMQ.Artemis.Client.IntegrationTests.TopologyManagement
             var queueNames = await topologyManager.GetQueueNamesAsync(CancellationToken);
             Assert.DoesNotContain(queue, queueNames);
 
-            await Assert.ThrowsAsync<ConsumerClosedException>(async () => await consumer.ReceiveAsync(CancellationToken));
+            // The broker removed the consumer. Automatic recovery takes over instead of
+            // surfacing a terminal ConsumerClosedException, so the consumer reports Unavailable.
+            await consumerUnavailable.Task.WaitAsync(CancellationToken);
+
+            // ReceiveAsync now waits for the consumer to be recreated rather than failing.
+            using var shortTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await consumer.ReceiveAsync(shortTimeout.Token));
+
+            await consumer.DisposeAsync();
         }
     }
 }
